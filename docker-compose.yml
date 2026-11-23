@@ -1,0 +1,108 @@
+# Hush: privacy-first micro-blogging platform
+#   docker compose up -d --build                 -> https://localhost
+#   docker compose --profile tor up -d --build   -> additionally exposes a Tor onion service
+name: hush
+
+services:
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    # Encryption at rest: InnoDB tablespace encryption with a file keyring kept on its own volume.
+    # (For production, move the keyring to Vault/KMIP or an HSM.) Binary and general logs stay off.
+    command: >
+      --early-plugin-load=keyring_file.so
+      --keyring_file_data=/var/lib/mysql-files/keyring
+      --default-table-encryption=ON
+      --skip-log-bin
+      --general-log=OFF
+      --skip-name-resolve
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?run scripts/gen-secrets.sh}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-privmicro}
+      MYSQL_USER: ${MYSQL_USER:-privmicro}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?run scripts/gen-secrets.sh}
+    volumes:
+      - db-data:/var/lib/mysql
+      - db-keyring:/var/lib/mysql-files
+      - ./docker/mysql:/docker-entrypoint-initdb.d:ro
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DB_URL: jdbc:mysql://db:3306/${MYSQL_DATABASE:-privmicro}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USER: ${MYSQL_USER:-privmicro}
+      DB_PASSWORD: ${MYSQL_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?run scripts/gen-secrets.sh}
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?run scripts/gen-secrets.sh}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      SESSION_MINUTES: ${SESSION_MINUTES:-120}
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [internal]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/api/auth/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    networks: [internal]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/locations.conf:/etc/nginx/locations.conf:ro
+      - ./docker/nginx/proxy-params.conf:/etc/nginx/proxy-params.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      backend: { condition: service_healthy }
+      frontend: { condition: service_started }
+    networks: [internal, edge]
+    security_opt: ["no-new-privileges:true"]
+
+  tor:
+    profiles: [tor]
+    build: ./docker/tor
+    restart: unless-stopped
+    depends_on: [proxy]
+    networks: [edge]
+    volumes:
+      - tor-data:/var/lib/tor
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  # frontend, backend and database talk here; this network has no route to the host or the internet
+  internal:
+    internal: true
+  # only the reverse proxy (and the optional Tor container) touch this one
+  edge: {}
+
+volumes:
+  db-data:
+  db-keyring:
+  tor-data:

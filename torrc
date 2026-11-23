@@ -1,0 +1,6 @@
+# v3 onion service for Hush. The address is written to /var/lib/tor/hidden_service/hostname
+DataDirectory /var/lib/tor
+HiddenServiceDir /var/lib/tor/hidden_service/
+HiddenServicePort 80 proxy:8080
+SafeLogging 1
+Log notice stderr
